@@ -3,52 +3,72 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"runtime"
-	"strings"
+	"sync/atomic"
 	"time"
-
-	"zgo.at/utils/syncutil"
-	"zgo.at/utils/timeutil"
 )
 
 var (
-	status     = syncutil.NewAtomicInt(0)
-	lastChange = syncutil.NewAtomicInt(int32(time.Now().UTC().Unix()))
-	buffer     = make(chan *http.Request, bufSize)
-	client     = http.Client{Timeout: 3 * time.Second}
+	isDown = NewAtomicInt(0)
+	buffer = make(chan *http.Request, bufSize)
+	client = http.Client{Timeout: 3 * time.Second}
 )
 
 func checkBackend() {
-	setTo := int32(0)
+	setTo := int32(-1)
 	resp, err := client.Get(backendCheck)
 	if err == nil {
 		resp.Body.Close()
 		if resp.StatusCode < 300 {
-			setTo = 1
+			setTo = 0
 		}
 	}
 
-	if status.Value() != setTo {
-		status.Set(setTo)
-		lastChange.Set(int32(time.Now().UTC().Unix())) // TODO: 2038
+	v := isDown.Value()
+	if v != setTo {
+		if setTo == 1 {
+			log.Println("status changed to UP")
+		} else {
+			log.Println("status changed to DOWN")
+		}
+		isDown.Set(setTo)
 	}
 }
 
+func rec() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	log.Printf("PANIC: %+v\n", r)
+}
+
+// AtomicInt uses sync/atomic to store and read the value of an int32.
+type AtomicInt int32
+
+// NewAtomicInt creates an new AtomicInt.
+func NewAtomicInt(value int32) *AtomicInt {
+	var i AtomicInt
+	i.Set(value)
+	return &i
+}
+
+func (i *AtomicInt) Set(value int32) { atomic.StoreInt32((*int32)(i), value) }
+func (i *AtomicInt) Value() int32    { return atomic.LoadInt32((*int32)(i)) }
+
 func main() {
+	log.SetPrefix("httpbuf: ")
+
 	defer rec()
 
 	// Ping backend status.
-	checkBackend()
 	go func() {
 		defer rec()
 		for {
-			checkBackend()
 			time.Sleep(backendPingFrequency)
+			checkBackend()
 		}
 	}()
 
@@ -56,36 +76,10 @@ func main() {
 	go func() {
 		defer rec()
 
-		var i uint8
 		for {
 			time.Sleep(bufferFrequency)
 
-			if i%24 == 0 {
-				fmt.Println("Buffer        Backend    HeapAlloc    TotalAlloc       Live     Sys    NumGC")
-				i = 0
-			}
-			i++
-
-			change := time.Now().UTC().Sub(time.Unix(int64(lastChange.Value()), 0))
-			st := fmt.Sprintf("%s down", timeutil.FormatDuration(change))
-			s := false
-			if status.Value() == 1 {
-				s = true
-				st = fmt.Sprintf("%s up", timeutil.FormatDuration(change))
-			}
-
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
-			fmt.Printf("%s    %s %s   %sK    %sK    %s    %sM    %s\n",
-				fill(uint64(len(buffer)), 6),
-				strings.Repeat(" ", 10-len(st)), st,
-				fill(m.Alloc/1024, 9),
-				fill(m.TotalAlloc/1024, 9),
-				fill(m.Mallocs-m.Frees, 7),
-				fill(m.Sys/1024/1014, 3),
-				fill(uint64(m.NumGC), 5))
-
-			if !s {
+			if isDown.Value() == 0 {
 				continue
 			}
 
@@ -105,20 +99,19 @@ func main() {
 				}
 				r.URL.Host = r.Host
 
-				fmt.Printf("  sending %s … ", r.URL)
 				resp, err := client.Do(r)
 				if err != nil {
-					fmt.Printf("failed: %s\n", err)
+					log.Printf("  Sending %s FAILED: %s\n", r.URL, err)
 					buffer <- r
 					continue
 				}
 
 				resp.Body.Close()
 				if resp.StatusCode >= 300 {
-					fmt.Printf("failed: %s\n", resp.Status)
+					log.Printf("  Sending %s FAILED: %s\n", r.URL, resp.Status)
 					buffer <- r
 				} else {
-					fmt.Println("Okay")
+					log.Printf("  Sending %s OKAY\n", r.URL)
 				}
 			}
 		}
@@ -126,38 +119,15 @@ func main() {
 
 	// Collect all requests.
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Clear context timeout.
-		r = r.WithContext(context.Background())
-
-		// Can't be set in requests.
-		r.RequestURI = ""
-
-		// Replace body with bytes.Reader as we can't read the standard body
-		// after getting it back from the channel.
-		b, _ := ioutil.ReadAll(r.Body)
+		r = r.WithContext(context.Background()) // Clear context timeout.
+		r.RequestURI = ""                       // Can't be set in requests.
+		b, _ := ioutil.ReadAll(r.Body)          // Replace body so we can read it later.
 		r.Body = ioutil.NopCloser(bytes.NewReader(b))
 
+		log.Printf("buffering %s\n", r.URL)
 		buffer <- r
 		w.WriteHeader(http.StatusNoContent)
 	})
-
-	fmt.Printf("Ready on %s\n\n", listen)
+	log.Printf("Ready on %s\n", listen)
 	log.Fatal(http.ListenAndServe(listen, nil))
-}
-
-func rec() {
-	r := recover()
-	if r == nil {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "httpbuf: panic: %+v\n", r)
-}
-
-func fill(s uint64, n int) string {
-	ss := fmt.Sprintf("%d", s)
-	l := len(ss)
-	if l >= n {
-		return ss
-	}
-	return strings.Repeat(" ", n-l) + ss
 }
